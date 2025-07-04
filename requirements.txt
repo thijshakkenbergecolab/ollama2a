@@ -1,0 +1,11 @@
+pydantic_ai
+ollama~=0.5.1
+setuptools~=80.9.0
+fasta2a~=0.3.5
+black
+psutil~=7.0.0
+a2a-sdk
+openai~=1.93.0
+httpx~=0.28.1
+pytest~=8.4.1
+pytest-asyncio

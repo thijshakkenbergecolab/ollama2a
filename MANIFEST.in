@@ -1,0 +1,23 @@
+include README.md
+include LICENSE
+include MANIFEST.in
+include pyproject.toml
+include requirements*.txt
+
+recursive-include ollama2a *.py
+recursive-include tests *.py
+
+exclude tests/*
+exclude .gitignore
+exclude .pytest_cache
+exclude .coverage
+exclude htmlcov/*
+exclude dist/*
+exclude build/*
+exclude *.egg-info/*
+
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude __pycache__
+global-exclude .DS_Store
