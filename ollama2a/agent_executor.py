@@ -1,18 +1,65 @@
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.openai import OpenAIModel
-from typing import List, AsyncIterator, Dict, Any
+from typing import List, AsyncIterator, Dict, Any, Optional
 from fastapi.responses import StreamingResponse
+from asyncio import TimeoutError as ATimeoutError
 from ollama import pull, list as ollama_list
 from dataclasses import dataclass, field
 from pydantic_ai import Agent, Tool
 from openai import AsyncOpenAI
-from datetime import datetime
+from datetime import datetime, timezone
 from fasta2a import FastA2A
-from fastapi import Request
+from fastapi import Request, HTTPException
+from pydantic import BaseModel, Field, ValidationError
 from logging import info
 from json import dumps
+from typing import Literal
 
 from ollama2a.ollama_manager import HybridOllamaManager
+
+
+class StreamRequest(BaseModel):
+    """Validation model for stream endpoint requests."""
+    prompt: str = Field(..., min_length=1, description="The prompt to stream responses for")
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    max_tokens: Optional[int] = Field(default=None, ge=1, description="Maximum tokens to generate")
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Top-p sampling parameter")
+    frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0, description="Frequency penalty")
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0, description="Presence penalty")
+    timeout: Optional[float] = Field(default=60.0, gt=0, description="Stream timeout in seconds")
+
+    @property
+    def completion_params(self):
+        completion_params = {
+            "model": self.ollama_model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": request.prompt},
+            ],
+            "stream": True,
+            "temperature": request.temperature,
+        }
+
+        # Add optional parameters if provided
+        if request.max_tokens is not None:
+            completion_params["max_tokens"] = request.max_tokens
+        if request.top_p is not None:
+            completion_params["top_p"] = request.top_p
+        if request.frequency_penalty is not None:
+            completion_params["frequency_penalty"] = request.frequency_penalty
+        if request.presence_penalty is not None:
+            completion_params["presence_penalty"] = request.presence_penalty
+        return completion_params
+
+
+def format_sse_event(
+    event_type: Literal["start", "content", "complete", "timeout", "error", "end"],
+    data: Dict[str, Any],
+) -> str:
+    """Format data as SSE event according to A2A protocol."""
+    event = f"event: {event_type}\n"
+    event += f"data: {dumps(data)}\n\n"
+    return event
 
 
 @dataclass
@@ -80,15 +127,23 @@ class OllamaAgentExecutor:
 
     def _add_streaming_endpoint(self):
         """Add A2A-compliant SSE streaming endpoint to the existing FastA2A app."""
+        from starlette.routing import Route
 
-        @self.app.post("/stream")
         async def stream_endpoint(request: Request):
-            """A2A-compliant SSE streaming endpoint."""
-            data = await request.json()
-            user_prompt = data.get("prompt", "")
+            """A2A-compliant SSE streaming endpoint with request validation."""
+            try:
+                # Parse and validate request data
+                data = await request.json()
+                stream_request = StreamRequest(**data)
+            except ValidationError as e:
+                # Return validation errors as HTTP 422
+                raise HTTPException(status_code=422, detail=e.errors())
+            except Exception as e:
+                # Handle JSON parsing errors
+                raise HTTPException(status_code=400, detail=f"Invalid request: {str(e)}")
 
             return StreamingResponse(
-                self._generate_sse_stream(user_prompt),
+                self._generate_sse_stream(stream_request),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -97,67 +152,77 @@ class OllamaAgentExecutor:
                 }
             )
 
-    async def _generate_sse_stream(self, prompt: str) -> AsyncIterator[str]:
-        """Generate A2A-compliant SSE events for streaming responses."""
+        # Add the route using FastA2A's add_route method
+        route = Route("/stream", endpoint=stream_endpoint, methods=["POST"])
+        self.app.routes.append(route)
+
+    async def _generate_sse_stream(self, request: StreamRequest) -> AsyncIterator[str]:
+        """Generate A2A-compliant SSE events for streaming responses with timeout handling."""
 
         # Send initial event
-        yield self._format_sse_event("start", {
-            "timestamp": datetime.utcnow().isoformat(),
+        yield _format_sse_event("start", {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "model": self.ollama_model,
-            "prompt": prompt
+            "prompt": request.prompt,
+            "timeout": request.timeout
         })
 
         try:
-            # Create streaming completion
-            stream = await self.client.chat.completions.create(
-                model=self.ollama_model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=True,
-                temperature=0.7,
+            # Build completion parameters with configurable values
+            cp = request.completion_params
+
+            # Create streaming completion with timeout
+            stream = await asyncio.wait_for(
+                self.client.chat.completions.create(**cp),
+                timeout=request.timeout
             )
 
             full_response = ""
             chunk_count = 0
+            start_time = asyncio.get_event_loop().time()
 
             async for chunk in stream:
+                # Check if we've exceeded the timeout during streaming
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed > request.timeout:
+                    raise ATimeoutError(f"Stream timeout after {elapsed:.2f} seconds")
+
                 if chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
                     full_response += content
                     chunk_count += 1
 
                     # Send content event
-                    yield self._format_sse_event("content", {
+                    yield format_sse_event("content", {
                         "text": content,
                         "chunk_id": chunk_count,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat()
                     })
 
             # Send completion event
-            yield self._format_sse_event("complete", {
+            yield format_sse_event("complete", {
                 "full_response": full_response,
                 "total_chunks": chunk_count,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        except asyncio.TimeoutError as e:
+            # Send timeout event
+            yield format_sse_event("timeout", {
+                "error": str(e) if str(e) else f"Stream timeout after {request.timeout} seconds",
+                "timeout_seconds": request.timeout,
+                "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
         except Exception as e:
             # Send error event
-            yield self._format_sse_event("error", {
+            yield format_sse_event("error", {
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
         finally:
             # Send end event
-            yield self._format_sse_event("end", {
-                "timestamp": datetime.utcnow().isoformat()
+            yield format_sse_event("end", {
+                "timestamp": datetime.now(timezone.utc).isoformat()
             })
-
-    def _format_sse_event(self, event_type: str, data: Dict[str, Any]) -> str:
-        """Format data as SSE event according to A2A protocol."""
-        event = f"event: {event_type}\n"
-        event += f"data: {dumps(data)}\n\n"
-        return event
-
