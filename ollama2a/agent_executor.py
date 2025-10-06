@@ -1,19 +1,19 @@
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.models.openai import OpenAIModel
 from typing import List, AsyncIterator, Dict, Any, Optional
-from fastapi.responses import StreamingResponse
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_ai.models.openai import OpenAIModel
 from asyncio import TimeoutError as ATimeoutError
+from fastapi.responses import StreamingResponse
 from ollama import pull, list as ollama_list
+from fastapi import Request, HTTPException
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pydantic_ai import Agent, Tool
 from openai import AsyncOpenAI
-from datetime import datetime, timezone
 from fasta2a import FastA2A
-from fastapi import Request, HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from typing import Literal
 from logging import info
 from json import dumps
-from typing import Literal
 
 from ollama2a.ollama_manager import HybridOllamaManager
 
