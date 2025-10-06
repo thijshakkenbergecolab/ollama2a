@@ -1,0 +1,13 @@
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.10.0
+pytest-asyncio>=0.21.0
+
+# For coverage reporting
+coverage>=7.0.0
+
+# Optional: for better test output
+pytest-sugar>=0.9.6
+pytest-xdist>=3.0.0  # for parallel test execution

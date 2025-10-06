@@ -287,3 +287,5 @@ local_settings.py
 # Development scripts
 dev_*.py
 test_*.sh
+
+.pypirc

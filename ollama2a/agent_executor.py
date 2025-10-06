@@ -1,12 +1,16 @@
-from logging import info
-from fasta2a import FastA2A
-from pydantic_ai import Agent, Tool
-from ollama import pull, list as ollama_list
-from openai import AsyncOpenAI
-from dataclasses import dataclass, field
-from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from typing import List
+from pydantic_ai.models.openai import OpenAIModel
+from typing import List, AsyncIterator, Dict, Any
+from fastapi.responses import StreamingResponse
+from ollama import pull, list as ollama_list
+from dataclasses import dataclass, field
+from pydantic_ai import Agent, Tool
+from openai import AsyncOpenAI
+from datetime import datetime
+from fasta2a import FastA2A
+from fastapi import Request
+from logging import info
+from json import dumps
 
 from ollama2a.ollama_manager import HybridOllamaManager
 
@@ -24,7 +28,7 @@ class OllamaAgentExecutor:
     tools: List[Tool] = field(default_factory=list)
 
     a2a_port: int = 8000
-    manager: HybridOllamaManager() = field(init=False)
+    manager: HybridOllamaManager = field(init=False)
     client: AsyncOpenAI = field(init=False)
     llm_provider: OpenAIProvider = field(init=False)
     model: OpenAIModel = field(init=False)
@@ -65,20 +69,95 @@ class OllamaAgentExecutor:
         self.agent = Agent(
             self.model, instructions=self.system_prompt, tools=self.tools
         )
-        # Create the A2A server application
+        # Create the A2A server application with streaming support
         self.app = self.agent.to_a2a(
             url=f"http://{self.ollama_host}:{self.a2a_port}",
             description=self.description,
         )
 
+        # Add streaming endpoint to the existing app
+        self._add_streaming_endpoint()
 
-if __name__ == "__main__":
-    # Initialize the OllamaAgentExecutor
-    executor = OllamaAgentExecutor()
-    print(f"Initialized OllamaAgentExecutor with model: {executor.ollama_model}")
-    print(f"Client: {executor.client}")
-    print(f"LLM Provider: {executor.llm_provider}")
-    print(f"Model: {executor.model}")
-    print(f"Agent: {executor.agent}")
-    print(f"App: {executor.app}")
-    print(executor.agent.run_sync(user_prompt="What is the capital of France?"))
+    def _add_streaming_endpoint(self):
+        """Add A2A-compliant SSE streaming endpoint to the existing FastA2A app."""
+
+        @self.app.post("/stream")
+        async def stream_endpoint(request: Request):
+            """A2A-compliant SSE streaming endpoint."""
+            data = await request.json()
+            user_prompt = data.get("prompt", "")
+
+            return StreamingResponse(
+                self._generate_sse_stream(user_prompt),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+
+    async def _generate_sse_stream(self, prompt: str) -> AsyncIterator[str]:
+        """Generate A2A-compliant SSE events for streaming responses."""
+
+        # Send initial event
+        yield self._format_sse_event("start", {
+            "timestamp": datetime.utcnow().isoformat(),
+            "model": self.ollama_model,
+            "prompt": prompt
+        })
+
+        try:
+            # Create streaming completion
+            stream = await self.client.chat.completions.create(
+                model=self.ollama_model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=True,
+                temperature=0.7,
+            )
+
+            full_response = ""
+            chunk_count = 0
+
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    full_response += content
+                    chunk_count += 1
+
+                    # Send content event
+                    yield self._format_sse_event("content", {
+                        "text": content,
+                        "chunk_id": chunk_count,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+
+            # Send completion event
+            yield self._format_sse_event("complete", {
+                "full_response": full_response,
+                "total_chunks": chunk_count,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+        except Exception as e:
+            # Send error event
+            yield self._format_sse_event("error", {
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+        finally:
+            # Send end event
+            yield self._format_sse_event("end", {
+                "timestamp": datetime.utcnow().isoformat()
+            })
+
+    def _format_sse_event(self, event_type: str, data: Dict[str, Any]) -> str:
+        """Format data as SSE event according to A2A protocol."""
+        event = f"event: {event_type}\n"
+        event += f"data: {dumps(data)}\n\n"
+        return event
+
