@@ -28,29 +28,6 @@ class StreamRequest(BaseModel):
     presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0, description="Presence penalty")
     timeout: Optional[float] = Field(default=60.0, gt=0, description="Stream timeout in seconds")
 
-    @property
-    def completion_params(self):
-        completion_params = {
-            "model": self.ollama_model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": request.prompt},
-            ],
-            "stream": True,
-            "temperature": request.temperature,
-        }
-
-        # Add optional parameters if provided
-        if request.max_tokens is not None:
-            completion_params["max_tokens"] = request.max_tokens
-        if request.top_p is not None:
-            completion_params["top_p"] = request.top_p
-        if request.frequency_penalty is not None:
-            completion_params["frequency_penalty"] = request.frequency_penalty
-        if request.presence_penalty is not None:
-            completion_params["presence_penalty"] = request.presence_penalty
-        return completion_params
-
 
 def format_sse_event(
     event_type: Literal["start", "content", "complete", "timeout", "error", "end"],
@@ -158,9 +135,10 @@ class OllamaAgentExecutor:
 
     async def _generate_sse_stream(self, request: StreamRequest) -> AsyncIterator[str]:
         """Generate A2A-compliant SSE events for streaming responses with timeout handling."""
+        import asyncio
 
         # Send initial event
-        yield _format_sse_event("start", {
+        yield format_sse_event("start", {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "model": self.ollama_model,
             "prompt": request.prompt,
@@ -169,11 +147,29 @@ class OllamaAgentExecutor:
 
         try:
             # Build completion parameters with configurable values
-            cp = request.completion_params
+            completion_params = {
+                "model": self.ollama_model,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": request.prompt},
+                ],
+                "stream": True,
+                "temperature": request.temperature,
+            }
+
+            # Add optional parameters if provided
+            if request.max_tokens is not None:
+                completion_params["max_tokens"] = request.max_tokens
+            if request.top_p is not None:
+                completion_params["top_p"] = request.top_p
+            if request.frequency_penalty is not None:
+                completion_params["frequency_penalty"] = request.frequency_penalty
+            if request.presence_penalty is not None:
+                completion_params["presence_penalty"] = request.presence_penalty
 
             # Create streaming completion with timeout
             stream = await asyncio.wait_for(
-                self.client.chat.completions.create(**cp),
+                self.client.chat.completions.create(**completion_params),
                 timeout=request.timeout
             )
 
@@ -206,7 +202,7 @@ class OllamaAgentExecutor:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
-        except asyncio.TimeoutError as e:
+        except ATimeoutError as e:
             # Send timeout event
             yield format_sse_event("timeout", {
                 "error": str(e) if str(e) else f"Stream timeout after {request.timeout} seconds",

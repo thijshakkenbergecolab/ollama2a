@@ -9,6 +9,7 @@ A Python library for running Ollama agents with automated server management.
 - 🔧 **Configurable**: Easy configuration of host, port, models, and tools
 - 🧪 **Well Tested**: Comprehensive test suite with high coverage
 - 📦 **Production Ready**: Robust error handling and resource management
+- 🌊 **Streaming Support**: A2A-compliant SSE streaming for real-time responses
 
 ## Installation
 
@@ -80,6 +81,68 @@ app = executor.app
 
 # Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+### Streaming API
+
+The library now includes A2A-compliant SSE streaming support for real-time responses:
+
+```python
+from ollama2a.agent_executor import OllamaAgentExecutor
+
+# Create executor with streaming support
+executor = OllamaAgentExecutor(
+    ollama_model="qwen3:0.6b",
+    system_prompt="You are a helpful assistant."
+)
+
+# The streaming endpoint is automatically available at /stream
+app = executor.app
+
+# Example client usage with httpx
+import httpx
+import json
+
+async def stream_chat():
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "http://localhost:8000/stream",
+            json={
+                "prompt": "Tell me a story",
+                "temperature": 0.7,
+                "max_tokens": 500
+            },
+            timeout=60.0
+        )
+
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if "text" in data:
+                    print(data["text"], end="", flush=True)
+```
+
+#### Streaming Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | `str` | Required | The prompt to stream responses for |
+| `temperature` | `float` | `0.7` | Sampling temperature (0.0-2.0) |
+| `max_tokens` | `int` | `None` | Maximum tokens to generate |
+| `top_p` | `float` | `None` | Top-p sampling parameter (0.0-1.0) |
+| `frequency_penalty` | `float` | `None` | Frequency penalty (-2.0 to 2.0) |
+| `presence_penalty` | `float` | `None` | Presence penalty (-2.0 to 2.0) |
+| `timeout` | `float` | `60.0` | Stream timeout in seconds |
+
+#### SSE Event Types
+
+The streaming endpoint emits the following A2A-compliant SSE events:
+
+- `start`: Initial event with model info and parameters
+- `content`: Streaming text chunks with incremental content
+- `complete`: Final event with full response and statistics
+- `timeout`: Emitted if the stream exceeds the timeout
+- `error`: Emitted on errors with error details
+- `end`: Final event marking stream completion
 
 ## Configuration
 
@@ -192,7 +255,15 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Changelog
 
-### 0.1.0 (2025-01-XX)
+### 1.1.0 (2025-10-07)
+
+- Added A2A-compliant SSE streaming support
+- New `/stream` endpoint for real-time responses
+- Configurable streaming parameters (temperature, max_tokens, etc.)
+- Timeout handling for streaming requests
+- Comprehensive test coverage for streaming features
+
+### 1.0.0 (2025-09-12)
 
 - Initial release
 - Basic Ollama server management

@@ -1,7 +1,9 @@
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from pytest import raises, main
+import pytest
+from pydantic import ValidationError
 
-from ollama2a.agent_executor import OllamaAgentExecutor
+from ollama2a.agent_executor import OllamaAgentExecutor, StreamRequest, format_sse_event
 
 
 class TestOllamaAgentExecutor:
@@ -471,6 +473,280 @@ class TestOllamaAgentExecutorIntegration:
         assert executor.model == mock_model_instance
         assert executor.agent == mock_agent_instance
         assert executor.app == mock_app_instance
+
+
+class TestStreamRequest:
+    """Test suite for StreamRequest model"""
+
+    def test_valid_stream_request_minimal(self):
+        """Test StreamRequest with minimal valid data"""
+        request = StreamRequest(prompt="Test prompt")
+        assert request.prompt == "Test prompt"
+        assert request.temperature == 0.7
+        assert request.max_tokens is None
+        assert request.top_p is None
+        assert request.frequency_penalty is None
+        assert request.presence_penalty is None
+        assert request.timeout == 60.0
+
+    def test_valid_stream_request_full(self):
+        """Test StreamRequest with all parameters"""
+        request = StreamRequest(
+            prompt="Test prompt",
+            temperature=1.5,
+            max_tokens=100,
+            top_p=0.9,
+            frequency_penalty=0.5,
+            presence_penalty=-0.5,
+            timeout=30.0
+        )
+        assert request.prompt == "Test prompt"
+        assert request.temperature == 1.5
+        assert request.max_tokens == 100
+        assert request.top_p == 0.9
+        assert request.frequency_penalty == 0.5
+        assert request.presence_penalty == -0.5
+        assert request.timeout == 30.0
+
+    def test_invalid_empty_prompt(self):
+        """Test StreamRequest validation with empty prompt"""
+        with raises(ValidationError) as exc_info:
+            StreamRequest(prompt="")
+        errors = exc_info.value.errors()
+        assert any(e["loc"] == ("prompt",) for e in errors)
+
+    def test_invalid_temperature_range(self):
+        """Test StreamRequest validation with invalid temperature"""
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", temperature=-0.1)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", temperature=2.1)
+
+    def test_invalid_max_tokens(self):
+        """Test StreamRequest validation with invalid max_tokens"""
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", max_tokens=0)
+
+    def test_invalid_top_p_range(self):
+        """Test StreamRequest validation with invalid top_p"""
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", top_p=-0.1)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", top_p=1.1)
+
+    def test_invalid_penalty_ranges(self):
+        """Test StreamRequest validation with invalid penalties"""
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", frequency_penalty=-2.1)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", frequency_penalty=2.1)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", presence_penalty=-2.1)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", presence_penalty=2.1)
+
+    def test_invalid_timeout(self):
+        """Test StreamRequest validation with invalid timeout"""
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", timeout=0)
+
+        with raises(ValidationError):
+            StreamRequest(prompt="Test", timeout=-1)
+
+
+class TestStreamingMethods:
+    """Test suite for streaming methods in OllamaAgentExecutor"""
+
+    @pytest.mark.asyncio
+    @patch("ollama2a.agent_executor.HybridOllamaManager")
+    @patch("ollama2a.agent_executor.AsyncOpenAI")
+    @patch("ollama2a.agent_executor.OpenAIProvider")
+    @patch("ollama2a.agent_executor.OpenAIModel")
+    @patch("ollama2a.agent_executor.Agent")
+    @patch("ollama2a.agent_executor.FastA2A")
+    @patch("ollama2a.agent_executor.list")
+    @patch("ollama2a.agent_executor.pull")
+    async def test_stream_endpoint_added(
+        self,
+        mock_pull,
+        mock_list,
+        mock_fasta2a,
+        mock_agent,
+        mock_openai_model,
+        mock_openai_provider,
+        mock_async_openai,
+        mock_manager_class,
+    ):
+        """Test that stream endpoint is added to the app"""
+        # Mock the list response
+        mock_models_response = Mock()
+        mock_model = Mock()
+        mock_model.model = "qwen3:0.6b"
+        mock_models_response.models = [mock_model]
+        mock_list.return_value = mock_models_response
+
+        # Mock manager and other components
+        mock_manager_instance = Mock()
+        mock_manager_instance.base_url = "http://localhost:11434"
+        mock_manager_class.return_value = mock_manager_instance
+
+        mock_agent_instance = Mock()
+        mock_app_instance = Mock()
+        mock_app_instance.routes = []
+        mock_agent_instance.to_a2a.return_value = mock_app_instance
+        mock_agent.return_value = mock_agent_instance
+
+        executor = OllamaAgentExecutor()
+
+        # Check that stream endpoint was added
+        assert len(mock_app_instance.routes) == 1
+        route = mock_app_instance.routes[0]
+        assert route.path == "/stream"
+        assert "POST" in route.methods
+
+    @pytest.mark.asyncio
+    async def test_generate_sse_stream_success(self):
+        """Test successful SSE stream generation"""
+        import asyncio
+
+        # Create executor without triggering post_init
+        executor = OllamaAgentExecutor.__new__(OllamaAgentExecutor)
+        executor.ollama_model = "test-model"
+        executor.system_prompt = "Test prompt"
+
+        # Mock client
+        mock_client = AsyncMock()
+        executor.client = mock_client
+
+        # Mock streaming response
+        mock_chunk = Mock()
+        mock_chunk.choices = [Mock()]
+        mock_chunk.choices[0].delta.content = "Hello"
+
+        async def mock_stream_generator():
+            yield mock_chunk
+
+        mock_stream = mock_stream_generator()
+
+        # Mock the create method to return our stream
+        async def mock_create(**kwargs):
+            return mock_stream
+
+        mock_client.chat.completions.create = mock_create
+
+        # Create request
+        request = StreamRequest(prompt="Test", timeout=60)
+
+        # Generate stream
+        events = []
+        async for event in executor._generate_sse_stream(request):
+            events.append(event)
+
+        # Verify events
+        assert len(events) >= 3  # start, content, complete/end
+        assert "event: start" in events[0]
+        assert "event: content" in events[1]
+        assert '"text": "Hello"' in events[1]
+
+    @pytest.mark.asyncio
+    async def test_generate_sse_stream_timeout(self):
+        """Test SSE stream generation with timeout"""
+        import asyncio
+        from asyncio import TimeoutError as ATimeoutError
+
+        # Create executor without triggering post_init
+        executor = OllamaAgentExecutor.__new__(OllamaAgentExecutor)
+        executor.ollama_model = "test-model"
+        executor.system_prompt = "Test prompt"
+
+        # Mock client that times out
+        mock_client = AsyncMock()
+        executor.client = mock_client
+
+        # Mock the create method to raise TimeoutError
+        mock_client.chat.completions.create.side_effect = ATimeoutError("Stream timeout")
+
+        # Create request with short timeout
+        request = StreamRequest(prompt="Test", timeout=0.1)
+
+        # Generate stream
+        events = []
+        async for event in executor._generate_sse_stream(request):
+            events.append(event)
+
+        # Verify timeout event was sent
+        assert any("event: timeout" in e for e in events)
+        assert any("Stream timeout" in e or "0.1 seconds" in e for e in events)
+        assert any("event: end" in e for e in events)
+
+    @pytest.mark.asyncio
+    async def test_generate_sse_stream_error(self):
+        """Test SSE stream generation with error"""
+        # Create executor without triggering post_init
+        executor = OllamaAgentExecutor.__new__(OllamaAgentExecutor)
+        executor.ollama_model = "test-model"
+        executor.system_prompt = "Test prompt"
+
+        # Mock client that raises error
+        mock_client = AsyncMock()
+        executor.client = mock_client
+
+        async def error_create(**kwargs):
+            raise Exception("API Error")
+
+        mock_client.chat.completions.create = error_create
+
+        # Create request
+        request = StreamRequest(prompt="Test")
+
+        # Generate stream
+        events = []
+        async for event in executor._generate_sse_stream(request):
+            events.append(event)
+
+        # Verify error event was sent
+        assert any("event: error" in e for e in events)
+        assert any("API Error" in e for e in events)
+        assert any("event: end" in e for e in events)
+
+
+class TestFormatSSEEvent:
+    """Test suite for format_sse_event function"""
+
+    def test_format_start_event(self):
+        """Test formatting start event"""
+        result = format_sse_event("start", {"timestamp": "2024-01-01T00:00:00Z"})
+        assert result == 'event: start\ndata: {"timestamp": "2024-01-01T00:00:00Z"}\n\n'
+
+    def test_format_content_event(self):
+        """Test formatting content event"""
+        result = format_sse_event("content", {"text": "Hello", "chunk_id": 1})
+        assert result == 'event: content\ndata: {"text": "Hello", "chunk_id": 1}\n\n'
+
+    def test_format_complete_event(self):
+        """Test formatting complete event"""
+        result = format_sse_event("complete", {"full_response": "Done", "total_chunks": 5})
+        assert result == 'event: complete\ndata: {"full_response": "Done", "total_chunks": 5}\n\n'
+
+    def test_format_error_event(self):
+        """Test formatting error event"""
+        result = format_sse_event("error", {"error": "Something went wrong"})
+        assert result == 'event: error\ndata: {"error": "Something went wrong"}\n\n'
+
+    def test_format_timeout_event(self):
+        """Test formatting timeout event"""
+        result = format_sse_event("timeout", {"error": "Timeout", "timeout_seconds": 60})
+        assert result == 'event: timeout\ndata: {"error": "Timeout", "timeout_seconds": 60}\n\n'
+
+    def test_format_end_event(self):
+        """Test formatting end event"""
+        result = format_sse_event("end", {"timestamp": "2024-01-01T00:01:00Z"})
+        assert result == 'event: end\ndata: {"timestamp": "2024-01-01T00:01:00Z"}\n\n'
 
 
 if __name__ == "__main__":
