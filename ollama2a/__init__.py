@@ -2,7 +2,7 @@
 ollama2a - A Python library for running Ollama agents with automated server management.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __author__ = "Thijs Hakkenberg"
 __email__ = "thijs.hakkenberg@ecolab.com"
 
